@@ -1,0 +1,15 @@
+--- TODO ----------------------------------------------------------------------
+
+REQUESTS
+
+  * reimplement the text buffer as a gap buffer.
+
+PROGRESSING
+
+  * move operations.
+
+FINSIHED
+
+  * write and erase operations.
+
+  
