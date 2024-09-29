@@ -1,167 +1,129 @@
 #if !defined(INCLUDED_KMST)
 #define INCLUDED_KMST
 
-#include "kmst-stuff.c"
-
-/*****************************************************************************/
-
-uint mass_of_heap = 0;
-
-void *acquire_memory(uint size)
-{
-  void *memory = malloc(size);
-  mass_of_heap += size;
-  return memory;
-}
-
-void release_memory(void *memory, uint size)
-{
-  free(memory);
-  mass_of_heap -= size;
-}
-
-/*****************************************************************************/
-
-typedef struct chunk chunk;
-struct chunk
-{
-  uint size;
-  uint mass;
-  byte *memory;
-  chunk *prior;
-  alignas(universal_alignment) u8 tailing_memory[];
-};
-
-typedef struct
-{
-  chunk *chunk;
-  uint minimum_chunk_size;
-  bit enabled_nullify : 1;
-} linear_allocator;
-
-uint minimum_chunk_size_of_default_linear_allocator = 4096;
-
-void *push_into_linear_allocator(uint size, uint alignment, linear_allocator *state)
-{
-  uint forward_alignment = state->chunk ? align_forwards((address)state->chunk->memory + state->chunk->mass, alignment) : 0; 
-  if(!state->chunk || state->chunk->mass + forward_alignment + size > state->chunk->size)
-  {
-    state->minimum_chunk_size = get_maximum(minimum_chunk_size_of_default_linear_allocator, state->minimum_chunk_size);
-    uint new_chunk_size = get_maximum(size, state->minimum_chunk_size);
-    chunk *new_chunk = acquire_memory(sizeof(chunk) + new_chunk_size);
-    new_chunk->size = new_chunk_size;
-    new_chunk->mass = 0;
-    new_chunk->memory = new_chunk->tailing_memory;
-    new_chunk->prior = state->chunk;
-    state->chunk = new_chunk;
-  }
-  forward_alignment = get_forward_alignment((address)state->chunk->memory + state->chunk->mass, alignment);
-  void *memory = state->chunk->memory + state->chunk->mass + forward_alignment;
-  if(state->enabled_nullify) fill_memory(memory, size, 0);
-  state->chunk->mass += forward_alignment + size;
-  return memory;
-}
-
-void pop_from_linear_allocator(uint size, uint alignment, linear_allocator *state)
-{
-  while(state->chunk && size)
-  {
-    uint mass = state->chunk->mass;
-    size += get_backward_alignment((address)state->chunk->memory + mass, alignment);
-    bool releasable_chunk = (sintl)mass - size <= 0;
-    state->chunk->mass -= size;
-    if(releasable_chunk)
-    {
-      chunk *releasable_chunk = state->chunk;
-      state->chunk = state->chunk->prior;
-      release_memory(releasable_chunk, releasable_chunk->size);
-      size -= mass;
-    }
-    else size = 0;
-  }
-}
-
-/*****************************************************************************/
-
-typedef enum
-{
-  ALLOCATOR_linear = 0x01,
-} allocator_type;
-
-typedef void *push_procedure(uint size, uint alignment, void *state);
-typedef void pop_procedure(uint size, uint alignment, void *state);
-
-typedef struct
-{
-  allocator_type type;
-  void *state;
-  push_procedure *push;
-  pop_procedure *pop;
-} allocator;
-
-thread_local linear_allocator state_of_default_allocator;
-
-thread_local allocator default_allocator =
-{
-  .type  = ALLOCATOR_linear,
-  .state = 0,
-  .push  = (push_procedure *)&push_into_linear_allocator,
-  .pop   = (pop_procedure *)&pop_from_linear_allocator,
-};
-
-/*****************************************************************************/
-
-thread_local struct
-{
-  allocator *allocator;
-} context;
-
-inline void *push(uint size, uint alignment)
-{
-  allocator *allocator = context.allocator;
-  return allocator->push(size, alignment, allocator->state);
-}
-
-#define push_type(type, count) (type *)push(count * sizeof(type), alignof(type))
-
-inline void pop(uint size, uint alignment)
-{
-  allocator *allocator = context.allocator;
-  allocator->pop(size, alignment, allocator->state);
-}
-
-#define pop_type(type, count) pop(count * sizeof(type), alignof(type))
-
-/*****************************************************************************/
-
-utf8 *get_utf8_from_utf16(const utf16 *utf16_string, uint utf16_string_size)
-{
-  s32 utf8_string_size = WideCharToMultiByte(CP_UTF8, 0, utf16_string, utf16_string_size, 0, 0, 0, 0);
-  if(!utf8_string_size) return 0;
-  utf8 *utf8_string = (utf8 *)push(utf8_string_size, universal_alignment);
-  WideCharToMultiByte(CP_UTF8, 0, utf16_string, utf16_string_size, utf8_string, utf8_string_size, 0, 0);
-  return utf8_string;
-}
-
-/*****************************************************************************/
+#include "kmst_stuff.c"
 
 static utf8 *command_line;
 
+typedef struct
+{
+  const utf8 *file_path;
+  uints file_path_size;
+  handle file_handle;
+  uint text_size;
+  uint text_capacity;
+  byte *text;
+} text_buffer;
+
+void read_file_into_text_buffer(const utf8 *file_path, text_buffer *state)
+{
+  state->file_path = file_path;
+  state->file_path_size = get_string_size(file_path);
+  log_note("file_path: %.*s\n", state->file_path_size, state->file_path);
+  log_note("file_path_size: %u\n", state->file_path_size);
+  state->file_handle = open_file(file_path);
+  {
+    uintl file_size = get_file_size(state->file_handle);
+    assert(file_size <= maximum_value_of_uint);
+    state->text_size = file_size;
+    log_note("text_size: %u\n", state->text_size);
+  }
+  state->text_capacity = align_forwards(state->text_size, memory_page_size);
+  log_note("text_capacity: %u\n", state->text_capacity);
+  state->text = (byte *)allocate_memory(state->text_capacity);
+  read_from_file(state->text, state->text_size, state->file_handle);
+}
+
+void write_into_text_buffer(uint offset, const utf8 *text, uint size, text_buffer *state)
+{
+  if(state->text_size + size > state->text_capacity)
+  {
+    uint new_text_capacity = align_forwards(state->text_capacity + size, memory_page_size);
+    state->text = reallocate_memory(new_text_capacity, state->text, state->text_capacity);
+    state->text_capacity = new_text_capacity;
+  }
+  byte *pointer = state->text + offset;
+  move_memory(pointer + size, pointer, state->text_size - offset);
+  copy_memory(pointer, text, size);
+  state->text_size += size;
+}
+
+void erase_from_text_buffer(uint offset, uint size, text_buffer *state)
+{
+  if(size > offset) offset = size;
+  byte *pointer = state->text + offset;
+  move_memory(pointer - size, pointer, state->text_size - offset);
+  state->text_size -= size;
+}
+
 static inline void initialize_globals(void) /* for convenience */
-{ 
+{
+  /* initialize context */
   default_allocator.state = &state_of_default_allocator;
   context.allocator = &default_allocator;
-  
+
+  /* get the command line*/  
   utf16 *utf16_command_line = GetCommandLine();
   uint utf16_command_line_size = wcslen(utf16_command_line);
-  command_line = get_utf8_from_utf16(utf16_command_line, utf16_command_line_size);
+  command_line = make_utf8_from_utf16(utf16_command_line, utf16_command_line_size);
 }
 
 int main(void)
 {
   initialize_globals();
+  log_note("maximum_size_for_path: %u\n", maximum_size_for_path);
+  log_note("command_line: %s\n", command_line);
+
+  text_buffer text_buffer;
+  read_file_into_text_buffer("./test.txt", &text_buffer);
+  printf("%.*s", text_buffer.text_size, text_buffer.text);
+
+  uint offset = 0;
+  for(;;)
+  {
+    bool ok = true;
+
+    char cmd[32], arg[32];
+    uint cmdsz=0, argsz=0;
+    bool oncmd=1;
+    for(char c = getchar(); c != '\n' && c != EOF; c = getchar()) {
+      if(oncmd) {
+        if(c == ' ') {
+          oncmd = 0;
+          continue;
+        }
+        cmd[cmdsz++] = c;
+      } else arg[argsz++] = c;
+    }
+    cmd[cmdsz] = arg[argsz] = 0;
+
+    if(!strcmp(cmd, "print")){
+      log_note("print()\n");
+      printf("%.*s\n", text_buffer.text_size, text_buffer.text);
+    } else if(!strcmp(cmd, "write")) {
+      log_note("write(%s)\n", arg);
+      write_into_text_buffer(offset, arg, argsz, &text_buffer);
+      offset += argsz;
+    } else if(!strcmp(cmd, "erase")) {
+      if(!offset) {
+        log_note("offset is 0.\n");
+        ok=0;
+      } else {
+        char *end;
+        uint erasesz = strtoul(arg, &end, 10);
+        log_note("erase(%u)\n", erasesz);
+        erase_from_text_buffer(offset, erasesz, &text_buffer);
+        offset -= erasesz;
+      }
+    } else if(!strcmp(cmd, "exit")) {
+      break;
+    } else {
+      ok = false;
+      log_note("unknown command: %s(%s)\n", cmd, arg);
+    }
+    cmdsz = argsz = 0;
+  }
   
-  printf(command_line);
   return 0;
 }
 
